@@ -843,6 +843,42 @@ class ProteinHunter_Boltz:
             if a.dual_context_mpnn:
                 run_metrics["best_joint_score"] = float(best_joint_score)
                 run_metrics["best_apo_plddt"] = float(best_apo_plddt)
+            else:
+                # Passive apo evaluation: fold the best design in isolation (no influence on selection)
+                print(f"\n[Apo eval] Run {run_id}: running apo Boltz prediction on best design ...")
+                try:
+                    data_apo_eval = self._build_apo_data(data_cp)
+                    output_apo_eval, structure_apo_eval = run_prediction(
+                        data_apo_eval,
+                        self.binder_chain,
+                        seq=best_seq,
+                        randomly_kill_helix_feature=False,
+                        negative_helix_constant=0.0,
+                        boltz_model=self.boltz_model,
+                        ccd_lib=self.ccd_lib,
+                        ccd_path=self.ccd_path,
+                        logmd=False,
+                        device=self.device,
+                        boltz_model_version=a.boltz_model_version,
+                        pocket_conditioning=False,
+                    )
+                    best_apo_plddt_eval = float(
+                        output_apo_eval.get("complex_plddt", torch.tensor([0.0]))
+                        .detach()
+                        .cpu()
+                        .numpy()[0]
+                    )
+                    best_apo_pdb_filename = (
+                        f"{run_save_dir}/{a.name}_run_{run_id}_best_apo_structure.pdb"
+                    )
+                    apo_plddts = output_apo_eval["plddt"].detach().cpu().numpy()[0]
+                    save_pdb(structure_apo_eval, output_apo_eval["coords"], apo_plddts, best_apo_pdb_filename)
+                    run_metrics["best_apo_plddt"] = best_apo_plddt_eval
+                    print(f"[Apo eval] Best design apo pLDDT: {best_apo_plddt_eval:.3f}")
+                except Exception as e:
+                    print(f"WARNING [Apo eval]: Apo prediction failed: {e}")
+                    run_metrics["best_apo_plddt"] = float("nan")
+                clean_memory()
         else:
             run_metrics["best_iptm"] = float("nan")
             run_metrics["best_cycle"] = None
@@ -850,7 +886,7 @@ class ProteinHunter_Boltz:
             run_metrics["best_seq"] = None
             if a.dual_context_mpnn:
                 run_metrics["best_joint_score"] = float("nan")
-                run_metrics["best_apo_plddt"] = float("nan")
+            run_metrics["best_apo_plddt"] = float("nan")
 
         if a.plot:
             plot_run_metrics(run_save_dir, a.name, run_id, a.num_cycles, run_metrics)
@@ -892,9 +928,9 @@ class ProteinHunter_Boltz:
                     ]
                 )
         # Best metric columns
-        columns.extend(["best_iptm", "best_cycle", "best_plddt", "best_seq"])
+        columns.extend(["best_iptm", "best_cycle", "best_plddt", "best_seq", "best_apo_plddt"])
         if a.dual_context_mpnn:
-            columns.extend(["best_joint_score", "best_apo_plddt"])
+            columns.append("best_joint_score")
 
         summary_csv = os.path.join(self.save_dir, "summary_all_runs.csv")
         df = pd.DataFrame(all_run_metrics)
