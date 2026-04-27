@@ -25,6 +25,7 @@ from model_utils import (
     get_boltz_model,
     get_cif,
     load_canonicals,
+    mix_and_sample_sequence,
     plot_from_pdb,
     plot_run_metrics,
     process_msa,
@@ -323,6 +324,20 @@ class ProteinHunter_Boltz:
             grad_enabled=self.args.grad_enabled,
         )
 
+    @staticmethod
+    def _build_apo_data(data_cp):
+        """Build a binder-only (apo) data dict from the full complex data dict.
+
+        Keeps only the binder chain 'A' protein entry (preserving the ``cyclic``
+        flag if present) and drops all target chains, ligands, nucleic acids,
+        templates, and constraints.
+        """
+        for entry in data_cp["sequences"]:
+            if "protein" in entry and "A" in entry["protein"].get("id", []):
+                binder_entry = copy.deepcopy(entry)
+                return {"sequences": [binder_entry]}
+        raise ValueError("Binder chain 'A' not found in data_cp sequences.")
+
     def _run_design_cycle(self, data_cp, run_id, pocket_conditioning):
         """
         Executes a single design run, including Cycle 0 contact filtering and
@@ -344,6 +359,12 @@ class ProteinHunter_Boltz:
         best_cycle_idx = -1
         best_alanine_percentage = None
         run_metrics = {"run_id": run_id}
+
+        # Dual-context tracking (active only when a.dual_context_mpnn is True)
+        best_joint_score = float("-inf")
+        best_apo_plddt = float("nan")
+        apo_pdb_filename = ""
+        data_apo = None
 
 
         if a.seq =="":
@@ -436,6 +457,38 @@ class ProteinHunter_Boltz:
             clean_memory()
 
         clean_memory() # <-- ADD THIS CALL HERE
+        # --- Dual-context: Cycle 0 apo prediction ---
+        if a.dual_context_mpnn:
+            print(f"\n[Dual-context] Run {run_id}: running apo (binder-only) Boltz prediction for cycle 0 ...")
+            data_apo = self._build_apo_data(data_cp)
+            try:
+                output_apo_0, structure_apo_0 = run_prediction(
+                    data_apo,
+                    self.binder_chain,
+                    randomly_kill_helix_feature=False,
+                    negative_helix_constant=0.0,
+                    boltz_model=self.boltz_model,
+                    ccd_lib=self.ccd_lib,
+                    ccd_path=self.ccd_path,
+                    logmd=False,
+                    device=self.device,
+                    boltz_model_version=a.boltz_model_version,
+                    pocket_conditioning=False,
+                )
+                apo_pdb_filename = f"{run_save_dir}/{a.name}_run_{run_id}_predicted_apo_cycle_0.pdb"
+                apo_plddts_0 = output_apo_0["plddt"].detach().cpu().numpy()[0]
+                save_pdb(structure_apo_0, output_apo_0["coords"], apo_plddts_0, apo_pdb_filename)
+                cycle_0_apo_plddt = float(
+                    output_apo_0.get("complex_plddt", torch.tensor([0.0])).detach().cpu().numpy()[0]
+                )
+                run_metrics["cycle_0_apo_plddt"] = cycle_0_apo_plddt
+                print(f"[Dual-context] Cycle 0 apo pLDDT: {cycle_0_apo_plddt:.3f}")
+            except Exception as e:
+                print(f"WARNING [Dual-context]: Apo prediction failed at cycle 0: {e}")
+                apo_pdb_filename = pdb_filename  # fall back to holo PDB
+                run_metrics["cycle_0_apo_plddt"] = float("nan")
+            clean_memory()
+
         # Capture Cycle 0 metrics
         binder_chain_idx = CHAIN_TO_NUMBER[self.binder_chain]
         pair_chains = output["pair_chains_iptm"]
@@ -488,11 +541,36 @@ class ProteinHunter_Boltz:
                 "bias_AA": f"A:{alpha}" if a.alanine_bias else "",
             }
 
-            seq_str, logits = design_sequence(
-                self.designer, model_type, **design_kwargs
-            )
-            # The output seq_str is a dictionary-like string, we extract the binder chain sequence
-            seq = seq_str.split(":")[CHAIN_TO_NUMBER[self.binder_chain]] 
+            if a.dual_context_mpnn:
+                # --- Dual-context MPNN: mix holo and apo probability distributions ---
+                omit_aa_this_cycle = f"{a.omit_AA},P" if cycle == 0 else a.omit_AA
+                try:
+                    _, p_holo = design_sequence(
+                        self.designer, model_type, return_logits=True, **design_kwargs
+                    )
+                    apo_design_kwargs = dict(design_kwargs)
+                    apo_design_kwargs["pdb_file"] = apo_pdb_filename
+                    _, p_apo = design_sequence(
+                        self.designer, model_type, return_logits=True, **apo_design_kwargs
+                    )
+                    seq = mix_and_sample_sequence(
+                        p_holo,
+                        p_apo,
+                        apo_weight=a.apo_mpnn_weight,
+                        omit_AA=omit_aa_this_cycle,
+                        binder_length=binder_length,
+                    )
+                    print(f"[Dual-context] Mixed sequence sampled (apo_weight={a.apo_mpnn_weight}).")
+                except Exception as e:
+                    print(f"WARNING [Dual-context]: MPNN mixing failed: {e}. Falling back to holo-only MPNN.")
+                    seq_str, _ = design_sequence(self.designer, model_type, **design_kwargs)
+                    seq = seq_str.split(":")[CHAIN_TO_NUMBER[self.binder_chain]]
+            else:
+                seq_str, logits = design_sequence(
+                    self.designer, model_type, **design_kwargs
+                )
+                # The output seq_str is a dictionary-like string, we extract the binder chain sequence
+                seq = seq_str.split(":")[CHAIN_TO_NUMBER[self.binder_chain]]
 
             # Update data_cp with new sequence
             alanine_count = seq.count("A")
@@ -501,7 +579,7 @@ class ProteinHunter_Boltz:
             )
             update_binder_sequence(seq) # Use the helper function
 
-            # 2. Structure Prediction
+            # 2. Structure Prediction (holo)
             output, structure = run_prediction(
                 data_cp,
                 self.binder_chain,
@@ -532,24 +610,98 @@ class ProteinHunter_Boltz:
             else:
                 current_iptm = 0.0
 
+            # --- Dual-context: Apo structure prediction (sequential, after holo) ---
+            current_apo_plddt = float("nan")
+            current_joint_score = current_iptm  # default: same as iptm
+            if a.dual_context_mpnn and data_apo is not None:
+                # Save holo PDB first (needed before memory cleanup)
+                pdb_filename = (
+                    f"{run_save_dir}/{a.name}_run_{run_id}_predicted_cycle_{cycle + 1}.pdb"
+                )
+                plddts = output["plddt"].detach().cpu().numpy()[0]
+                save_pdb(structure, output["coords"], plddts, pdb_filename)
+                clean_memory()  # free holo GPU memory before apo run
+
+                try:
+                    print(f"[Dual-context] Run {run_id} cycle {cycle + 1}: running apo Boltz prediction ...")
+                    output_apo, structure_apo = run_prediction(
+                        data_apo,
+                        self.binder_chain,
+                        seq=seq,
+                        randomly_kill_helix_feature=False,
+                        negative_helix_constant=0.0,
+                        boltz_model=self.boltz_model,
+                        ccd_lib=self.ccd_lib,
+                        ccd_path=self.ccd_path,
+                        logmd=False,
+                        device=self.device,
+                        boltz_model_version=a.boltz_model_version,
+                        pocket_conditioning=False,
+                    )
+                    apo_pdb_filename = (
+                        f"{run_save_dir}/{a.name}_run_{run_id}_predicted_apo_cycle_{cycle + 1}.pdb"
+                    )
+                    apo_plddts = output_apo["plddt"].detach().cpu().numpy()[0]
+                    save_pdb(structure_apo, output_apo["coords"], apo_plddts, apo_pdb_filename)
+                    current_apo_plddt = float(
+                        output_apo.get("complex_plddt", torch.tensor([0.0])).detach().cpu().numpy()[0]
+                    )
+                    print(f"[Dual-context] Apo pLDDT: {current_apo_plddt:.3f}")
+                except Exception as e:
+                    print(f"WARNING [Dual-context]: Apo prediction failed at cycle {cycle + 1}: {e}")
+                    current_apo_plddt = float("nan")
+
+                # Joint score: weighted combination of holo ipTM and apo pLDDT
+                if not np.isnan(current_apo_plddt):
+                    current_joint_score = (
+                        (1.0 - a.apo_mpnn_weight) * current_iptm
+                        + a.apo_mpnn_weight * current_apo_plddt
+                    )
+                else:
+                    current_joint_score = current_iptm  # fall back to holo only
+
             # Update best structure (only if alanine content is acceptable)
-            if alanine_percentage <= 0.20 and current_iptm > best_iptm:
-                best_iptm = current_iptm
-                best_seq = seq
-                best_structure = copy.deepcopy(structure)
-                best_output = shallow_copy_tensor_dict(output)
-                best_pdb_filename = (
-                    f"{run_save_dir}/{a.name}_run_{run_id}_best_structure.pdb"
-                )
-                best_plddts = best_output["plddt"].detach().cpu().numpy()[0]
-                save_pdb(
-                    best_structure,
-                    best_output["coords"],
-                    best_plddts,
-                    best_pdb_filename,
-                )
-                best_cycle_idx = cycle + 1
-                best_alanine_percentage = alanine_percentage
+            if a.dual_context_mpnn:
+                # Use joint score for best selection when dual-context is active
+                apo_ok = (a.min_apo_plddt <= 0.0 or np.isnan(current_apo_plddt) or
+                          current_apo_plddt >= a.min_apo_plddt)
+                if alanine_percentage <= 0.20 and current_joint_score > best_joint_score and apo_ok:
+                    best_joint_score = current_joint_score
+                    best_apo_plddt = current_apo_plddt
+                    best_iptm = current_iptm
+                    best_seq = seq
+                    best_structure = copy.deepcopy(structure)
+                    best_output = shallow_copy_tensor_dict(output)
+                    best_pdb_filename = (
+                        f"{run_save_dir}/{a.name}_run_{run_id}_best_structure.pdb"
+                    )
+                    best_plddts = best_output["plddt"].detach().cpu().numpy()[0]
+                    save_pdb(
+                        best_structure,
+                        best_output["coords"],
+                        best_plddts,
+                        best_pdb_filename,
+                    )
+                    best_cycle_idx = cycle + 1
+                    best_alanine_percentage = alanine_percentage
+            else:
+                if alanine_percentage <= 0.20 and current_iptm > best_iptm:
+                    best_iptm = current_iptm
+                    best_seq = seq
+                    best_structure = copy.deepcopy(structure)
+                    best_output = shallow_copy_tensor_dict(output)
+                    best_pdb_filename = (
+                        f"{run_save_dir}/{a.name}_run_{run_id}_best_structure.pdb"
+                    )
+                    best_plddts = best_output["plddt"].detach().cpu().numpy()[0]
+                    save_pdb(
+                        best_structure,
+                        best_output["coords"],
+                        best_plddts,
+                        best_pdb_filename,
+                    )
+                    best_cycle_idx = cycle + 1
+                    best_alanine_percentage = alanine_percentage
 
             # 3. Log Metrics and Save PDB
             curr_plddt = float(
@@ -570,17 +722,29 @@ class ProteinHunter_Boltz:
             run_metrics[f"cycle_{cycle + 1}_iplddt"] = curr_iplddt
             run_metrics[f"cycle_{cycle + 1}_alanine"] = alanine_count
             run_metrics[f"cycle_{cycle + 1}_seq"] = seq
+            if a.dual_context_mpnn:
+                run_metrics[f"cycle_{cycle + 1}_apo_plddt"] = current_apo_plddt
+                run_metrics[f"cycle_{cycle + 1}_joint_score"] = current_joint_score
 
-            pdb_filename = (
-                f"{run_save_dir}/{a.name}_run_{run_id}_predicted_cycle_{cycle + 1}.pdb"
-            )
-            plddts = output["plddt"].detach().cpu().numpy()[0]
-            save_pdb(structure, output["coords"], plddts, pdb_filename)
+            if not a.dual_context_mpnn:
+                # In dual-context mode, pdb_filename was already saved above (before apo run)
+                pdb_filename = (
+                    f"{run_save_dir}/{a.name}_run_{run_id}_predicted_cycle_{cycle + 1}.pdb"
+                )
+                plddts = output["plddt"].detach().cpu().numpy()[0]
+                save_pdb(structure, output["coords"], plddts, pdb_filename)
             clean_memory()
 
-            print(
-                f"ipTM: {current_iptm:.2f} pLDDT: {curr_plddt:.2f} iPLDDT: {curr_iplddt:.2f} Alanine count: {alanine_count}"
-            )
+            if a.dual_context_mpnn:
+                _apo_str = f"{current_apo_plddt:.3f}" if not np.isnan(current_apo_plddt) else "N/A"
+                print(
+                    f"ipTM: {current_iptm:.2f} pLDDT: {curr_plddt:.2f} iPLDDT: {curr_iplddt:.2f} "
+                    f"Apo pLDDT: {_apo_str} Joint: {current_joint_score:.3f} Alanine count: {alanine_count}"
+                )
+            else:
+                print(
+                    f"ipTM: {current_iptm:.2f} pLDDT: {curr_plddt:.2f} iPLDDT: {curr_iplddt:.2f} Alanine count: {alanine_count}"
+                )
 
             # 4. Save YAML for High ipTM
             save_yaml_this_design = (alanine_percentage <= 0.20) and (
@@ -676,11 +840,17 @@ class ProteinHunter_Boltz:
                 .numpy()[0]
             )
             run_metrics["best_seq"] = best_seq
+            if a.dual_context_mpnn:
+                run_metrics["best_joint_score"] = float(best_joint_score)
+                run_metrics["best_apo_plddt"] = float(best_apo_plddt)
         else:
             run_metrics["best_iptm"] = float("nan")
             run_metrics["best_cycle"] = None
             run_metrics["best_plddt"] = float("nan")
             run_metrics["best_seq"] = None
+            if a.dual_context_mpnn:
+                run_metrics["best_joint_score"] = float("nan")
+                run_metrics["best_apo_plddt"] = float("nan")
 
         if a.plot:
             plot_run_metrics(run_save_dir, a.name, run_id, a.num_cycles, run_metrics)
@@ -691,8 +861,20 @@ class ProteinHunter_Boltz:
         """Saves all run metrics to a single CSV file."""
         a = self.args
         columns = ["run_id"]
-        # Columns for cycle 0 through num_cycles
-        for i in range(a.num_cycles + 1):
+        # Columns for cycle 0
+        columns.extend(
+            [
+                "cycle_0_iptm",
+                "cycle_0_plddt",
+                "cycle_0_iplddt",
+                "cycle_0_alanine",
+                "cycle_0_seq",
+            ]
+        )
+        if a.dual_context_mpnn:
+            columns.append("cycle_0_apo_plddt")
+        # Columns for cycles 1 through num_cycles
+        for i in range(1, a.num_cycles + 1):
             columns.extend(
                 [
                     f"cycle_{i}_iptm",
@@ -702,8 +884,17 @@ class ProteinHunter_Boltz:
                     f"cycle_{i}_seq",
                 ]
             )
+            if a.dual_context_mpnn:
+                columns.extend(
+                    [
+                        f"cycle_{i}_apo_plddt",
+                        f"cycle_{i}_joint_score",
+                    ]
+                )
         # Best metric columns
         columns.extend(["best_iptm", "best_cycle", "best_plddt", "best_seq"])
+        if a.dual_context_mpnn:
+            columns.extend(["best_joint_score", "best_apo_plddt"])
 
         summary_csv = os.path.join(self.save_dir, "summary_all_runs.csv")
         df = pd.DataFrame(all_run_metrics)

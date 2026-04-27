@@ -111,6 +111,26 @@ def parse_args():
     parser.add_argument("--alanine_bias", action="store_true")
     parser.add_argument("--high_iptm_threshold", default=0.8, type=float)
     parser.add_argument("--high_plddt_threshold", default=0.8, type=float)
+    # --- Dual-context MPNN (Phase B) ---
+    parser.add_argument(
+        "--dual_context_mpnn",
+        action="store_true",
+        default=False,
+        help="Enable dual-context MPNN: run MPNN on holo and apo structures, mix probabilities, "
+             "and evaluate both contexts with Boltz on every cycle.",
+    )
+    parser.add_argument(
+        "--apo_mpnn_weight",
+        default=0.3,
+        type=float,
+        help="Weight for the apo MPNN distribution when mixing (0=holo only, 1=apo only). Default: 0.3.",
+    )
+    parser.add_argument(
+        "--min_apo_plddt",
+        default=0.0,
+        type=float,
+        help="Minimum apo pLDDT required to accept a design as best (0 = no hard cutoff). Default: 0.0.",
+    )
     # --- End Existing Arguments ---
 
     return parser.parse_args()

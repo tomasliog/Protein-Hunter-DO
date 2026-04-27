@@ -56,6 +56,52 @@ warnings.filterwarnings(
 
 alphabet = list[str]("XXARNDCQEGHILKMFPSTWYV-")
 
+# LigandMPNN amino-acid alphabet (matches data_utils.restype_str_to_int ordering)
+MPNN_ALPHABET = "ACDEFGHIKLMNPQRSTVWYX"
+
+
+def mix_and_sample_sequence(
+    p_holo,
+    p_apo,
+    apo_weight: float,
+    omit_AA: str = "C",
+    binder_length: int = None,
+) -> str:
+    """Mix holo and apo MPNN probability distributions and sample a binder sequence.
+
+    Args:
+        p_holo: Tensor [total_L, 21] – per-position AA probabilities from holo MPNN.
+        p_apo:  Tensor [L_apo,  21] – per-position AA probabilities from apo MPNN.
+        apo_weight: Weight for apo distribution (0 → holo only, 1 → apo only).
+        omit_AA: String of amino-acid single-letter codes to exclude (e.g. "C").
+        binder_length: Number of binder residues.  Used to slice p_holo to chain A.
+
+    Returns:
+        Sampled binder sequence as a single-letter string of length ``binder_length``.
+    """
+    # Slice both tensors to binder length (chain A is first in holo PDB).
+    if binder_length is not None:
+        p_holo = p_holo[:binder_length]
+        p_apo = p_apo[:binder_length]
+
+    # Linear mixture of per-position probability distributions.
+    p_mix = (1.0 - apo_weight) * p_holo + apo_weight * p_apo  # [L, 21]
+
+    # Apply omit_AA masking (zero out forbidden columns).
+    for aa in omit_AA:
+        if aa in MPNN_ALPHABET:
+            idx = MPNN_ALPHABET.index(aa)
+            p_mix[:, idx] = 0.0
+
+    # Renormalise after masking to ensure valid probability distribution.
+    p_sum = p_mix.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    p_mix = p_mix / p_sum
+
+    # Sample one amino acid per position from the mixed distribution.
+    sampled = torch.multinomial(p_mix, num_samples=1).squeeze(-1)  # [L]
+
+    return "".join(MPNN_ALPHABET[int(i)] for i in sampled.tolist())
+
 def get_cif(cif_code=""):
     """
     Returns the local filename (relative path) to the CIF for the provided code or file.

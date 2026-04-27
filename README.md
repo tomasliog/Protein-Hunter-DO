@@ -207,6 +207,53 @@ After running AlphaFold3, the validated (successfully predicted) structures are 
 - [ ] Specify multiple contacts on multiple targets 
 - [ ] Explore other cool applications
 
+---
+
+## 🧬 Dual-Context MPNN (Phase B)
+
+> **Goal**: Improve binder foldability by co-optimising sequences for **(1) binder + target complex (holo)** and **(2) binder alone (apo)** in every design cycle.
+
+### How it works
+
+1. **Holo MPNN** – designs the binder in the context of the full complex PDB (existing behaviour).
+2. **Apo MPNN** – designs the binder using a binder-only PDB (target chains removed).
+3. **Probability mixing** – per-position amino-acid distributions from both contexts are linearly combined:
+   ```
+   p_mix = (1 - w) * p_holo + w * p_apo
+   ```
+   where `w` is `--apo_mpnn_weight` (default `0.3`).  The mixed distribution is used to sample the next binder sequence.
+4. **Dual Boltz evaluation** – the sampled sequence is evaluated **sequentially** with Boltz, first as the holo complex and then as the apo (binder-only) monomer.  `clean_memory()` is called between runs to reduce VRAM pressure.
+5. **Joint selection score** – the best design is chosen by:
+   ```
+   joint_score = (1 - w) * ipTM_holo + w * pLDDT_apo
+   ```
+   All existing `iptm`, `plddt`, and `iplddt` fields are still logged; new `apo_plddt` and `joint_score` columns are added to the summary CSV.
+
+### New CLI arguments
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--dual_context_mpnn` | flag | `False` | Enable dual-context mode |
+| `--apo_mpnn_weight` | float | `0.3` | Weight for the apo MPNN distribution (`0` = holo only, `1` = apo only) |
+| `--min_apo_plddt` | float | `0.0` | Hard minimum apo pLDDT to accept a design as best (`0` = no cutoff) |
+
+### Example command
+
+```bash
+python boltz_ph/design.py \
+  --num_designs 3 --num_cycles 7 \
+  --protein_seqs AFTVTVPKDLYVVEYGSNMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNAPYAAALE \
+  --msa_mode mmseqs --gpu_id 0 \
+  --name PDL1_dual_context \
+  --min_protein_length 30 --max_protein_length 60 \
+  --high_iptm_threshold 0.7 \
+  --dual_context_mpnn \
+  --apo_mpnn_weight 0.3 \
+  --min_apo_plddt 0.5
+```
+
+> **Note**: Dual-context mode runs two Boltz predictions per cycle (holo + apo) on the **same GPU sequentially**.  Expect roughly **2× longer cycle times** compared to standard mode.  For short peptide binders (< 40 residues), consider lowering `--min_apo_plddt` or setting it to `0.0` because apo pLDDT for short peptides can be low even for valid designs.
+
 Collaboration is always welcome! Email me. Let's chat.
 
 ## 📄 License & Citation
