@@ -89,7 +89,7 @@ class LigandMPNNWrapper:
             if bias_AA:
                 cmd += ["--bias_AA", bias_AA]
             if return_logits:
-                cmd += ["--return_logits"]
+                cmd += ["--return_logits", "1"]
             if chains_to_design:
                 if isinstance(chains_to_design, (list, tuple)):
                     chains_to_design = "".join(chains_to_design)

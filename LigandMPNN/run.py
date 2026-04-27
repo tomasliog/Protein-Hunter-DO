@@ -513,6 +513,14 @@ def main(args) -> None:
             if args.save_stats:
                 torch.save(out_dict, output_stats_path)
 
+            if args.return_logits:
+                import json as _json
+                _return_data = {
+                    "S": S_stack.cpu().tolist(),
+                    "log_probs": log_probs_stack.cpu().tolist(),
+                }
+                print(_json.dumps(_return_data))
+
             if args.pack_side_chains:
                 if args.verbose:
                     print("Packing side chains...")
@@ -893,6 +901,13 @@ if __name__ == "__main__":
     )
     argparser.add_argument(
         "--save_stats", type=int, default=0, help="Save output statistics"
+    )
+
+    argparser.add_argument(
+        "--return_logits",
+        type=int,
+        default=0,
+        help="If 1, print S and log_probs as JSON to stdout (used by wrapper for logit mixing).",
     )
 
     argparser.add_argument(
